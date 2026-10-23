@@ -1,0 +1,244 @@
+"""Interview question generation: 5 general + 15 resume-grounded technical questions.
+
+Guarantees
+* Exactly 20 questions are stored, or generation fails with a clear error –
+  the system never pads with invented filler.
+* Technical questions may only mention technologies that appear in the
+  candidate's resume or in the job's own requirements.
+* Resume content sent to an AI provider is de-identified first and requires HR consent.
+"""
+import logging
+
+from django.db import transaction
+
+from apps.ai.client import get_client, resume_ai_allowed
+from apps.ai.errors import AIConfigurationError, AIProviderError
+from apps.core.defaults import GENERAL_QUESTIONS
+from apps.recruitment.services import skills as sk
+from apps.recruitment.services.sanitize import UNTRUSTED_NOTICE, wrap_untrusted
+
+from ..models import GENERAL_COUNT, TECHNICAL_COUNT, TOTAL_QUESTIONS, InterviewQuestion
+
+log = logging.getLogger(__name__)
+
+
+class GenerationError(Exception):
+    pass
+
+
+SYSTEM = (
+    "You are an expert technical interviewer designing questions for a human-led hiring process. "
+    + UNTRUSTED_NOTICE
+    + " Respond with one JSON object and nothing else."
+)
+
+
+def allowed_technologies(job, profile):
+    names = list(job.required_skills or []) + list(job.preferred_skills or []) + list(profile.get("skills", [])) + list(profile.get("technologies", []))
+    for p in profile.get("projects", []):
+        names += p.get("technologies", [])
+    for e in profile.get("experience", []):
+        names += e.get("technologies", [])
+    allowed = {sk.canonical(n) for n in names if n}
+    # a framework implies its language-level basics (e.g. Django -> Python, SQL)
+    implied = {"django": {"python", "orm", "sql", "rest apis"}, "django rest framework": {"django", "python", "rest apis", "jwt"},
+               "react": {"javascript", "html", "css"}, "postgresql": {"sql"}, "mysql": {"sql"}, "flask": {"python"}, "fastapi": {"python"},
+               "celery": {"redis", "rabbitmq"}, "next.js": {"react", "javascript"}, "node.js": {"javascript"}, "typescript": {"javascript"}}
+    for a in list(allowed):
+        allowed |= implied.get(a, set())
+    return allowed
+
+
+def unsupported_technologies(question_text, allowed):
+    return [t for t in sk.taxonomy_skills_in(question_text) if sk.canonical(t) not in allowed]
+
+
+def _profile_for_prompt(profile):
+    """De-identified profile: no name, email, phone."""
+    return {
+        "total_experience_years": profile.get("total_experience_years"),
+        "skills": profile.get("skills", [])[:40],
+        "experience": [{"role": e.get("header", ""), "bullets": e.get("bullets", [])[:5], "technologies": e.get("technologies", [])} for e in profile.get("experience", [])[:6]],
+        "projects": [{"name": p.get("name", ""), "description": p.get("description", ""), "technologies": p.get("technologies", [])} for p in profile.get("projects", [])[:6]],
+        "education": profile.get("education", [])[:4],
+        "certifications": profile.get("certifications", [])[:6],
+    }
+
+
+def _difficulty_for(years):
+    years = float(years or 0)
+    return "basic" if years < 1 else "intermediate" if years < 4 else "advanced"
+
+
+def _clean_question(q, allowed):
+    if not isinstance(q, dict):
+        return None, "not an object"
+    text = " ".join(str(q.get("text", "")).split())
+    if len(text) < 15 or len(text) > 700:
+        return None, "bad length"
+    bad = unsupported_technologies(text, allowed)
+    if bad:
+        return None, f"mentions technologies not in resume or job: {', '.join(bad)}"
+    points = [str(p)[:200] for p in (q.get("expected_points") or []) if str(p).strip()][:6]
+    if len(points) < 2:
+        return None, "needs expected points"
+    diff = str(q.get("difficulty", "")).lower()
+    return {
+        "text": text,
+        "expected_points": points,
+        "skill_tags": [str(t)[:40] for t in (q.get("skill_tags") or [])][:5],
+        "grounding": [str(g)[:200] for g in (q.get("grounding") or [])][:4],
+        "difficulty": diff if diff in {"basic", "intermediate", "advanced"} else "",
+    }, None
+
+
+def _ai_technical(client, job, profile, allowed, count=TECHNICAL_COUNT, avoid=()):
+    prof = _profile_for_prompt(profile)
+    user = f"""Job: {job.title}
+Required skills: {', '.join(job.required_skills)}
+Preferred skills: {', '.join(job.preferred_skills or [])}
+Responsibilities: {(job.responsibilities or job.description)[:1000]}
+Target difficulty from verified experience: {_difficulty_for(profile.get('total_experience_years'))}
+
+Candidate resume facts (untrusted data, de-identified):
+{wrap_untrusted('resume_facts', str(prof))}
+
+Write exactly {count} interview questions:
+- about 5 concept questions on skills that are both job-relevant and present in the resume,
+- about 7 questions about specific projects/experience in the resume (name the project or role),
+- about 3 questions on required job skills where resume evidence is thin (ask about exposure and approach).
+Rules: ONLY mention technologies that appear in the resume facts or in the job requirements. Never invent projects,
+employers or tools. One question at a time, no multi-part lists, answerable verbally in 1-3 minutes. Order easiest to hardest.
+{('Do not repeat these questions: ' + '; '.join(avoid)) if avoid else ''}
+
+JSON: {{"questions": [{{"text": "...", "skill_tags": ["Django"], "grounding": ["exact resume fact this relies on"],
+"expected_points": ["3-5 key points a good answer covers"], "difficulty": "basic|intermediate|advanced"}}]}}"""
+    data = client.complete_json(SYSTEM, user, max_tokens=6000)
+    return data.get("questions") or []
+
+
+def _mock_technical(job, profile):
+    """Clearly-labelled testing mode: templated questions built only from real resume/job facts."""
+    skills_in_resume = [s for s in profile.get("skills", [])]
+    required_found = [s for s in job.required_skills if any(sk.canonical(s) == sk.canonical(r) for r in skills_in_resume + profile.get("technologies", []))]
+    ordered_skills = list(dict.fromkeys(required_found + skills_in_resume))
+    gaps = [s for s in job.required_skills if s not in required_found]
+    projects = [p for p in profile.get("projects", []) if p.get("name")]
+    out = []
+    for p in projects[:3]:
+        n = p["name"]
+        out.append({"text": f"In your project '{n}', what was your specific responsibility and which technical decisions did you make?",
+                    "expected_points": ["clear personal responsibility", "specific technical decisions", "reasons for the decisions", "outcome"],
+                    "skill_tags": p.get("technologies", [])[:2], "grounding": [n], "difficulty": "intermediate"})
+        out.append({"text": f"What was the hardest technical challenge in '{n}' and how did you resolve it?",
+                    "expected_points": ["specific challenge", "debugging or design approach", "solution", "lessons learned"],
+                    "skill_tags": p.get("technologies", [])[:2], "grounding": [n], "difficulty": "intermediate"})
+    templates = [
+        ("Explain the core concepts of {s} and when you would choose it for a project.", ["accurate core concepts", "typical use cases", "trade-offs"], "basic"),
+        ("What common pitfalls or performance issues arise when working with {s}, and how do you avoid them?", ["named pitfalls", "mitigation techniques", "practical example"], "advanced"),
+        ("How have you tested or debugged code that uses {s}?", ["testing approach", "debugging tools", "practical example"], "intermediate"),
+    ]
+    for t_i in range(3):
+        for s in ordered_skills:
+            if len(out) >= TECHNICAL_COUNT - min(len(gaps), 2):
+                break
+            tpl = templates[t_i]
+            out.append({"text": tpl[0].format(s=s), "expected_points": [f"{x} ({s})" for x in tpl[1]], "skill_tags": [s],
+                        "grounding": [f"Resume lists {s}"], "difficulty": tpl[2]})
+    for s in gaps[:2]:
+        out.append({"text": f"The role requires {s}. Describe any exposure you have to it and how you would approach applying it in this job.",
+                    "expected_points": [f"honest description of exposure to {s}", "learning approach", "relevant adjacent experience"],
+                    "skill_tags": [s], "grounding": [f"Job requires {s}"], "difficulty": "intermediate"})
+    return out[:TECHNICAL_COUNT]
+
+
+def generate_technical(session, job, profile, org):
+    allowed = allowed_technologies(job, profile)
+    client = get_client(org)  # raises AIConfigurationError with a clear message
+    if client.is_mock:
+        raw = _mock_technical(job, profile)
+    else:
+        if not resume_ai_allowed(org):
+            raise AIConfigurationError(
+                "Generating personalised questions sends de-identified resume details to the AI provider. "
+                "An administrator must enable 'Allow AI processing of resume content' in Settings first."
+            )
+        raw = _ai_technical(client, job, profile, allowed)
+    accepted, seen, rejects = [], set(), []
+    for q in raw:
+        cleaned, why = _clean_question(q, allowed)
+        if cleaned and cleaned["text"].lower() not in seen:
+            seen.add(cleaned["text"].lower())
+            accepted.append(cleaned)
+        else:
+            rejects.append(why or "duplicate")
+    if len(accepted) < TECHNICAL_COUNT and not client.is_mock:
+        missing = TECHNICAL_COUNT - len(accepted)
+        extra = _ai_technical(client, job, profile, allowed, count=missing + 2, avoid=[a["text"] for a in accepted])
+        for q in extra:
+            cleaned, why = _clean_question(q, allowed)
+            if cleaned and cleaned["text"].lower() not in seen and len(accepted) < TECHNICAL_COUNT:
+                seen.add(cleaned["text"].lower())
+                accepted.append(cleaned)
+    # Top up with up to 2 generic (technology-neutral) questions when slightly short.
+    FALLBACK_TECHNICAL = [
+        {"text": "Walk me through how you would design, build and test a new feature end to end in your current tech stack.",
+         "expected_points": ["requirements clarification", "design approach", "implementation steps", "testing strategy"],
+         "skill_tags": [], "grounding": ["general"], "difficulty": "intermediate"},
+        {"text": "Describe a bug or production issue you debugged. How did you find the root cause and what did you change to prevent it?",
+         "expected_points": ["problem description", "debugging method", "root cause", "fix and prevention"],
+         "skill_tags": [], "grounding": ["general"], "difficulty": "intermediate"},
+    ]
+    if TECHNICAL_COUNT - 2 <= len(accepted) < TECHNICAL_COUNT:
+        for q in FALLBACK_TECHNICAL:
+            if len(accepted) >= TECHNICAL_COUNT:
+                break
+            if q["text"].lower() not in seen:
+                seen.add(q["text"].lower())
+                accepted.append(dict(q))
+    if len(accepted) < TECHNICAL_COUNT:
+        raise GenerationError(
+            f"Only {len(accepted)} valid resume-based questions could be produced (need {TECHNICAL_COUNT}). "
+            + ("The resume has too little extractable detail. " if client.is_mock else "")
+            + f"Rejected: {len(rejects)}. HR can edit the resume profile and retry."
+        )
+    order = {"basic": 0, "intermediate": 1, "advanced": 2, "": 1}
+    accepted = sorted(accepted[:TECHNICAL_COUNT], key=lambda q: order[q["difficulty"]])
+    return accepted, client
+
+
+@transaction.atomic
+def generate_questions(session):
+    """Create exactly 20 questions for the session. Raises GenerationError / AIConfigurationError / AIProviderError."""
+    candidate, job = session.candidate, session.job
+    profile = candidate.profile or {}
+    technical, client = generate_technical(session, job, profile, session.organization)
+    session.questions.all().delete()
+    rows = []
+    for i, g in enumerate(GENERAL_QUESTIONS):
+        rows.append(InterviewQuestion(session=session, index=i, section="general", rubric_type="behavioral", text=g["text"], original_text=g["text"],
+                                      expected_points=g["expected_points"], is_self_introduction=g.get("is_self_introduction", False)))
+    for j, q in enumerate(technical):
+        rows.append(InterviewQuestion(session=session, index=GENERAL_COUNT + j, section="technical", rubric_type="technical", text=q["text"],
+                                      original_text=q["text"], expected_points=q["expected_points"], skill_tags=q["skill_tags"],
+                                      grounding=q["grounding"], difficulty=q["difficulty"]))
+    assert len(rows) == TOTAL_QUESTIONS
+    InterviewQuestion.objects.bulk_create(rows)
+    session.status = session.Status.DRAFT
+    session.generation_error = ""
+    session.ai_provider = client.label()
+    session.is_mock = client.is_mock
+    session.save(update_fields=["status", "generation_error", "ai_provider", "is_mock"])
+    return rows
+
+
+def run_generation(session):
+    """Task-safe wrapper: records failure on the session instead of raising."""
+    try:
+        generate_questions(session)
+        return True
+    except (GenerationError, AIConfigurationError, AIProviderError) as exc:
+        session.status = session.Status.GENERATION_FAILED
+        session.generation_error = str(exc)[:1000]
+        session.save(update_fields=["status", "generation_error"])
+        return False

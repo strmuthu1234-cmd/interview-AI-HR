@@ -1,0 +1,30 @@
+{
+  "title": "Python Full Stack Developer",
+  "department": "Engineering",
+  "description": "Build and maintain web applications for our HR technology products using Python/Django on the backend and React on the frontend.",
+  "required_skills": [
+    "Python",
+    "Django",
+    "Django REST Framework",
+    "React.js",
+    "PostgreSQL",
+    "REST APIs",
+    "Git"
+  ],
+  "preferred_skills": [
+    "AWS",
+    "Docker",
+    "Redis",
+    "JWT",
+    "Celery"
+  ],
+  "min_experience_years": 1,
+  "max_experience_years": 3,
+  "responsibilities": "Design REST APIs, build React interfaces, write tests, review code, and deploy services.",
+  "mandatory_qualifications": [
+    "Bachelor's degree in Computer Science or a related field"
+  ],
+  "shortlist_size": 10,
+  "interview_duration_minutes": 45,
+  "interview_language": "en"
+}
